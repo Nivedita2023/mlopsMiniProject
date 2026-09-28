@@ -1,80 +1,211 @@
+import os
+import json
+import pickle
 import unittest
+import numpy as np
+import pandas as pd
 import dagshub
 import mlflow
-import os
-import pandas as pd
+import mlflow.pyfunc
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import pickle
 
-class TestModelLoading(unittest.TestCase):
+
+class TestMLOpsPipeline(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        mlflow.set_tracking_uri('https://dagshub.com/niveditaranjan223883/mlopsMiniProject.mlflow')
-        dagshub.init(repo_owner='niveditaranjan223883', repo_name='mlopsMiniProject', mlflow=True)
+        """
+        Setup MLflow registry connection via DagsHub and load test context.
+        Fetches the registered model directly from the MLflow Model Registry.
+        """
+        cls.repo_owner = "niveditaranjan223883"
+        cls.repo_name = "mlopsMiniProject"
+        cls.registered_model_name = "my-model"
+        cls.model_alias_or_stage = "Version 6"  # Alias as seen in MLflow UI (@staging)
 
-        # load the new model from MLflow model registry
-        cls.new_model_name = "my_model"
-        cls.new_model_version = cls.get_latest_model_version(cls.new_model_name)
-        cls.new_model_name = f'models:/{cls.new_model_name}/{cls.new_model_version}'
-        cls.new_model = mlflow.pyfunc.load_model(cls.new_model_uri)
+        cls.local_model_path = "./models/model.pkl"
+        cls.vectorizer_path = "./models/vectorizer.pkl"
+        cls.test_data_path = "./data/processed/test_bow.csv"
+        cls.metrics_json_path = "./reports/metrics.json"
+        cls.exp_info_json_path = "./reports/experiment_info.json"
 
-       # Load the vectorizer
-        cls.vectorizer = pickle.load(open('models/vectorizer.pkl', 'rb'))
+        # --------------------------------------------------
+        # 1. DagsHub & MLflow Authentication
+        # --------------------------------------------------
+        # Check both common environment variable names for CI/CD compatibility
+        dagshub_token = os.getenv("DAGSHUB_TOKEN") or os.getenv("DAGSHUB_PAT")
 
-        # Load holdout test data
-        cls.holdout_data = pd.read_csv('data/processed/test_bow.csv')                          
+        if dagshub_token:
+            os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_token
+            os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
 
-    @staticmethod
-    def get_latest_model_version(model_name, stage="Staging"):
-        client = mlflow.MlflowClient()
-        latest_version = client.get_latest_versions(model_name, stages=[stage])
-        return latest_version[0].version if latest_version else None
+        # Set MLflow Tracking URI to DagsHub
+        mlflow.set_tracking_uri(
+            f"https://dagshub.com/{cls.repo_owner}/{cls.repo_name}.mlflow"
+        )
+
+        # --------------------------------------------------
+        # 2. Fetch Model from MLflow Model Registry
+        # --------------------------------------------------
+        cls.model = None
+        try:
+            # Try loading via MLflow Model Registry using model alias
+            model_uri = f"models:/{cls.registered_model_name}@{cls.model_alias_or_stage}"
+            print(f"Loading model from MLflow Registry: {model_uri}")
+            cls.model = mlflow.pyfunc.load_model(model_uri)
+        except Exception as e:
+            print(f"Registry load by alias failed ({e}). Trying latest registered version...")
+            try:
+                client = mlflow.MlflowClient()
+                versions = client.search_model_versions(f"name='{cls.registered_model_name}'")
+                if versions:
+                    latest_version = max(versions, key=lambda v: int(v.version)).version
+                    model_uri = f"models:/{cls.registered_model_name}/{latest_version}"
+                    print(f"Loading latest version from Registry: {model_uri}")
+                    cls.model = mlflow.pyfunc.load_model(model_uri)
+            except Exception as registry_err:
+                print(f"Could not load model from MLflow Registry: {registry_err}")
+
+        # Fallback to local pickle file if MLflow Registry is unavailable/offline
+        if cls.model is None and os.path.exists(cls.local_model_path):
+            print(f"Fallback: Loading local model from {cls.local_model_path}")
+            with open(cls.local_model_path, "rb") as f:
+                cls.model = pickle.load(f)
+
+        # --------------------------------------------------
+        # 3. Load Vectorizer & Test Data
+        # --------------------------------------------------
+        if os.path.exists(cls.vectorizer_path):
+            with open(cls.vectorizer_path, "rb") as f:
+                cls.vectorizer = pickle.load(f)
+        else:
+            cls.vectorizer = None
+
+        if os.path.exists(cls.test_data_path):
+            cls.test_data = pd.read_csv(cls.test_data_path)
+        else:
+            cls.test_data = None
+
+    # ==========================================================
+    # 1. Pipeline Output & File Existence Tests
+    # ==========================================================
+
+    def test_pipeline_artifact_existence(self):
+        """Verify that essential local pipeline artifacts exist."""
+        self.assertTrue(
+            os.path.exists(self.vectorizer_path),
+            f"Vectorizer artifact missing at {self.vectorizer_path}"
+        )
+        self.assertTrue(
+            os.path.exists(self.test_data_path),
+            f"Processed test dataset missing at {self.test_data_path}"
+        )
+
+    def test_report_metrics_existence(self):
+        """Verify evaluation metrics and experiment info reports exist."""
+        self.assertTrue(
+            os.path.exists(self.metrics_json_path),
+            f"Metrics report missing at {self.metrics_json_path}"
+        )
+        self.assertTrue(
+            os.path.exists(self.exp_info_json_path),
+            f"Experiment info report missing at {self.exp_info_json_path}"
+        )
+
+    # ==========================================================
+    # 2. Model Integrity & Input Signature Tests
+    # ==========================================================
 
     def test_model_loaded_properly(self):
-        self.assertIsNotNone(self.new_model)
+        """Verify that the model was successfully loaded from MLflow or local fallback."""
+        self.assertIsNotNone(
+            self.model, "Failed to load model object from MLflow Registry or local path."
+        )
 
-    def test_model_signature(self):
-        # Create a dummy input for the model based on expected input shape
-        input_text = "hi how are you"
-        input_data = self.vectorizer.transform([input_text])
-        input_df = pd.DataFrame(input_data.toarray(), columns=[str(i) for i in range(input_data.shape[1])])
+    def test_model_feature_dimension_alignment(self):
+        """
+        Verify that the feature vector length generated by the vectorizer matches
+        the exact number of input features expected by the trained model.
+        """
+        self.assertIsNotNone(self.model, "Model not loaded.")
+        self.assertIsNotNone(self.vectorizer, "Vectorizer not loaded.")
 
-        # Predict using the new model to verify the input and output shapes
-        prediction = self.new_model.predict(input_df)
+        dummy_text = "This is a great product with awesome performance"
+        transformed_data = self.vectorizer.transform([dummy_text])
 
-        # Verify the input shape
-        self.assertEqual(input_df.shape[1], len(self.vectorizer.get_feature_names_out()))
+        # Get expected feature count from sklearn model directly or via PyFunc wrapper
+        if hasattr(self.model, "n_features_in_"):
+            expected_features = self.model.n_features_in_
+        elif hasattr(self.model, "_model_impl") and hasattr(self.model._model_impl, "n_features_in_"):
+            expected_features = self.model._model_impl.n_features_in_
+        else:
+            # Fallback check against test_bow.csv feature count
+            expected_features = self.test_data.shape[1] - 1
 
-        # Verify the output shape (assuming binary classification with a single output)
-        self.assertEqual(len(prediction), input_df.shape[0])
-        self.assertEqual(len(prediction.shape), 1)  # Assuming a single output column for binary classification
+        self.assertEqual(
+            transformed_data.shape[1],
+            expected_features,
+            f"Dimension mismatch! Vectorizer outputs {transformed_data.shape[1]} features, "
+            f"but model expects {expected_features} features."
+        )
+
+    # ==========================================================
+    # 3. Sanity / End-to-End Prediction Tests
+    # ==========================================================
+
+    def test_prediction_sanity_check(self):
+        """Smoke test ensuring end-to-end inference from raw text to class label."""
+        self.assertIsNotNone(self.model, "Model not loaded.")
+        self.assertIsNotNone(self.vectorizer, "Vectorizer not loaded.")
+
+        text_sample = ["I am very happy today with this result"]
+        transformed_sample = self.vectorizer.transform(text_sample)
+
+        # Predict using MLflow PyFunc or native model interface
+        prediction = self.model.predict(transformed_sample.toarray())
+
+        self.assertEqual(len(prediction), 1, "Prediction output batch size should be 1.")
+        self.assertIn(
+            int(prediction[0]),
+            [0, 1],
+            f"Unexpected class label: {prediction[0]}. Must be 0 or 1."
+        )
+
+    # ==========================================================
+    # 4. Performance Threshold Tests
+    # ==========================================================
 
     def test_model_performance(self):
-        # Extract features and labels from holdout test data
-        X_holdout = self.holdout_data.iloc[:,0:-1]
-        y_holdout = self.holdout_data.iloc[:,-1]
+        """Evaluate model performance on holdout data against quality standards."""
+        self.assertIsNotNone(self.model, "Model not loaded.")
+        self.assertIsNotNone(self.test_data, "Test data not loaded.")
 
-        # Predict using the new model
-        y_pred_new = self.new_model.predict(X_holdout)
+        X_test = self.test_data.iloc[:, :-1].values
+        y_test = self.test_data.iloc[:, -1].values
 
-        # Calculate performance metrics for the new model
-        accuracy_new = accuracy_score(y_holdout, y_pred_new)
-        precision_new = precision_score(y_holdout, y_pred_new)
-        recall_new = recall_score(y_holdout, y_pred_new)
-        f1_new = f1_score(y_holdout, y_pred_new)
+        y_pred = self.model.predict(X_test)
 
-        # Define expected thresholds for the performance metrics
-        expected_accuracy = 0.40
-        expected_precision = 0.40
-        expected_recall = 0.40
-        expected_f1 = 0.40
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
 
-        # Assert that the new model meets the performance thresholds
-        self.assertGreaterEqual(accuracy_new, expected_accuracy, f'Accuracy should be at least {expected_accuracy}')
-        self.assertGreaterEqual(precision_new, expected_precision, f'Precision should be at least {expected_precision}')
-        self.assertGreaterEqual(recall_new, expected_recall, f'Recall should be at least {expected_recall}')
-        self.assertGreaterEqual(f1_new, expected_f1, f'F1 score should be at least {expected_f1}')
+        # Baseline thresholds
+        min_threshold = 0.70
+
+        self.assertGreaterEqual(
+            acc, min_threshold, f"Accuracy below threshold: {acc:.4f} < {min_threshold}"
+        )
+        self.assertGreaterEqual(
+            prec, min_threshold, f"Precision below threshold: {prec:.4f} < {min_threshold}"
+        )
+        self.assertGreaterEqual(
+            rec, min_threshold, f"Recall below threshold: {rec:.4f} < {min_threshold}"
+        )
+        self.assertGreaterEqual(
+            f1, min_threshold, f"F1 score below threshold: {f1:.4f} < {min_threshold}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
