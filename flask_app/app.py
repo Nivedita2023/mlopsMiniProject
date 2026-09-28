@@ -1,3 +1,7 @@
+# ==========================================================
+# Import Required Libraries
+# ==========================================================
+
 import os
 import re
 import pickle
@@ -23,11 +27,44 @@ wordnet.ensure_loaded()
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english"))
 
-mlflow.set_tracking_uri('https://dagshub.com/niveditaranjan223883/mlopsMiniProject.mlflow')
-dagshub.init(repo_owner='niveditaranjan223883', repo_name='mlopsMiniProject', mlflow=True)
+# ==========================================================
+# Global Constants & Configuration
+# ==========================================================
 
-# Initialize Flask app
+REPO_OWNER = "niveditranjan223883"
+REPO_NAME = "mlopsMiniProject"
+REGISTERED_MODEL_NAME = "my-model"
 
+# ----------------------------------------------------------
+# Token Authentication Setup for CI/CD & Production
+# ----------------------------------------------------------
+dagshub_token = (
+    os.getenv("DAGSHUB_TOKEN") 
+    or os.getenv("DAGSHUB_PAT") 
+    or os.getenv("DAGSHUB_USER_TOKEN")
+)
+
+if dagshub_token:
+    os.environ["DAGSHUB_USER_TOKEN"] = dagshub_token
+    os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_token
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
+
+# Initialize DagsHub tracking non-interactively
+try:
+    dagshub.init(
+        repo_owner=REPO_OWNER,
+        repo_name=REPO_NAME,
+        mlflow=True
+    )
+    print("DagsHub tracking initialized successfully.")
+except Exception as e:
+    print(f"Warning: DagsHub initialization skipped/failed: {e}")
+
+mlflow.set_tracking_uri(
+    f"https://dagshub.com/{REPO_OWNER}/{REPO_NAME}.mlflow"
+)
+
+# Initialize Flask App
 app = Flask(__name__)
 
 # Base path resolution for local artifacts
@@ -67,6 +104,7 @@ def removing_punctuations(text: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+
 def removing_urls(text: str) -> str:
     """Remove URLs from text."""
     url_pattern = re.compile(r'https?://\S+|www\.\S+')
@@ -82,6 +120,7 @@ def normalize_text(text: str) -> str:
     text = removing_punctuations(text)
     text = lemmatization(text)
     return text
+
 
 # ==========================================================
 # Load Model & Feature Artifacts
@@ -115,10 +154,11 @@ def load_model_artifact(model_name: str):
 
 
 # Load Model and Local Vectorizer
-model = load_model_artifact("my-model")
+model = load_model_artifact(REGISTERED_MODEL_NAME)
 
 with open(VECTORIZER_PATH, "rb") as f:
     vectorizer = pickle.load(f)
+
 
 # ==========================================================
 # Flask Routes
